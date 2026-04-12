@@ -27,7 +27,7 @@ Structure:
 """
 
 
-def generate_draft(facts, feedback=None):
+def generate_draft(facts, memory, feedback=None):
     feedback_text = ""
 
     if feedback:
@@ -43,6 +43,9 @@ Missing Points:
     prompt = f"""
 FACTS:
 {facts}
+
+MEMORY:
+{memory}
 
 {feedback_text}
 
@@ -77,6 +80,7 @@ class WriterAgent:
 
     def run(self, researcher_output, feedback=None):
         facts = researcher_output["facts"]
+        memory = researcher_output.get("memory", [])
 
         if not facts:
             return {
@@ -84,7 +88,7 @@ class WriterAgent:
                 "facts_used": []
             }
 
-        draft = generate_draft(facts, feedback)
+        draft = generate_draft(facts, memory, feedback)
         draft = validate_output(draft, facts)
 
         return {

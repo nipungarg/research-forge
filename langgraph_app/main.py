@@ -1,91 +1,120 @@
+from langgraph.graph import StateGraph, END
+from typing import TypedDict, List, Dict, Any
+from openai import OpenAI
+import os
+from dotenv import load_dotenv
 from pathlib import Path
 
-from dotenv import load_dotenv
-from langgraph.graph import StateGraph, END
-from openai import OpenAI
-from typing import TypedDict, List, Dict, Any
-import os
+# ---- Your existing modules ----
 from multi_agent.researcher import ResearcherAgent
 from multi_agent.writer import WriterAgent
 from multi_agent.editor import EditorAgent
+from memory.store import MemoryStore
 from utils.logger import log_event, log_state
 from utils.monitor import detect_issues
 
+# ---- Init ----
 _here = Path(__file__).resolve().parent
 load_dotenv(_here.parent / ".env")
-
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+researcher = ResearcherAgent()
+writer = WriterAgent()
+editor = EditorAgent()
+memory_store = MemoryStore()
 
 # -------------------------
 # STATE DEFINITION
 # -------------------------
 class AgentState(TypedDict):
     query: str
-    facts: list
-    sources: list
+    facts: List[str]
+    sources: List[Dict[str, Any]]
     draft: str
-    feedback: dict
+    feedback: Dict
     iteration: int
     llm_calls: int
+    memory: List[Dict[str, Any]]
+
+
+# -------------------------
+# WRAPPER (Logging + Monitoring)
+# -------------------------
+def wrap_node(node_fn, node_name):
+    def wrapped(state: AgentState):
+        log_event("NODE_START", {"node": node_name})
+
+        new_state = node_fn(state)
+
+        log_state(node_name, new_state)
+
+        detect_issues(new_state)
+
+        return new_state
+    return wrapped
 
 
 # -------------------------
 # NODES
 # -------------------------
 
-researcher = ResearcherAgent()
+# 🧠 Memory Node
+def memory_node(state: AgentState):
+    past = memory_store.search(state["query"])
+
+    return {
+        **state,
+        "memory": past
+    }
+
+
+# 🔬 Researcher Node
 def researcher_node(state: AgentState):
     result = researcher.run(state["query"])
 
     return {
         **state,
-        "facts": result["facts"],
-        "sources": result["sources"]
+        "facts": result.get("facts", []),
+        "sources": result.get("sources", [])
     }
 
-writer = WriterAgent()
+
+# ✍️ Writer Node
 def writer_node(state: AgentState):
     writer_output = writer.run(
         {
             "facts": state["facts"],
-            "sources": state["sources"]
+            "sources": state["sources"],
+            "memory": state.get("memory", [])
         },
         feedback=state.get("feedback")
     )
 
-    state["llm_calls"] += 1
-
-    new_state = {
+    return {
         **state,
         "draft": writer_output["draft"],
-        "llm_calls": state["llm_calls"]
+        "llm_calls": state["llm_calls"] + 1
     }
 
-    return new_state
 
-editor = EditorAgent()
+# 🧑‍⚖️ Editor Node
 def editor_node(state: AgentState):
     review = editor.run({
         "draft": state["draft"],
         "facts_used": state["facts"]
     })
-    state["llm_calls"] += 1
 
-    new_state = {
+    return {
         **state,
         "feedback": review,
         "iteration": state["iteration"] + 1,
-        "llm_calls": state["llm_calls"]
+        "llm_calls": state["llm_calls"] + 1
     }
-
-    return new_state
 
 
 # -------------------------
 # ROUTING LOGIC
 # -------------------------
-
 def should_continue(state: AgentState):
     feedback = state["feedback"]
 
@@ -93,7 +122,7 @@ def should_continue(state: AgentState):
     if feedback.get("is_approved"):
         return END
 
-    # ⚠️ No improvement possible
+    # ⚠️ Nothing to improve
     if not feedback.get("issues") and not feedback.get("missing_points"):
         return END
 
@@ -105,35 +134,25 @@ def should_continue(state: AgentState):
 
 
 # -------------------------
-# GRAPH
+# GRAPH BUILDER
 # -------------------------
-
-def wrap_node(node_fn, node_name):
-    def wrapped(state):
-        log_event("NODE_START", {"node": node_name})
-
-        new_state = node_fn(state)
-
-        log_state(node_name, new_state)
-
-        detect_issues(new_state)
-
-        return new_state
-
-    return wrapped
-
 def build_graph():
     graph = StateGraph(AgentState)
 
+    graph.add_node("memory", wrap_node(memory_node, "memory"))
     graph.add_node("researcher", wrap_node(researcher_node, "researcher"))
     graph.add_node("writer", wrap_node(writer_node, "writer"))
     graph.add_node("editor", wrap_node(editor_node, "editor"))
 
-    graph.set_entry_point("researcher")
+    # Entry point
+    graph.set_entry_point("memory")
 
+    # Flow
+    graph.add_edge("memory", "researcher")
     graph.add_edge("researcher", "writer")
     graph.add_edge("writer", "editor")
 
+    # Loop
     graph.add_conditional_edges(
         "editor",
         should_continue,
@@ -149,11 +168,10 @@ def build_graph():
 # -------------------------
 # RUN
 # -------------------------
-
 if __name__ == "__main__":
     app = build_graph()
 
-    result = app.invoke({
+    initial_state = {
         "query": "Impact of AI in healthcare",
         "facts": [],
         "sources": [],
@@ -161,8 +179,19 @@ if __name__ == "__main__":
         "feedback": {},
         "iteration": 0,
         "llm_calls": 0,
+        "memory": []
+    }
+
+    result = app.invoke(initial_state)
+
+    # 💾 Save to memory
+    memory_store.save({
+        "query": result["query"],
+        "facts": result["facts"],
+        "final_output": result["draft"]
     })
 
+    # 🔥 FINAL OUTPUT (IMPORTANT FOR EVALUATION)
     final_output = {
         "draft": result["draft"],
         "state": result
@@ -170,3 +199,9 @@ if __name__ == "__main__":
 
     print("\n=== FINAL OUTPUT ===\n")
     print(final_output["draft"])
+
+    print("\n=== METRICS ===\n")
+    print({
+        "iterations": result["iteration"],
+        "llm_calls": result["llm_calls"]
+    })
