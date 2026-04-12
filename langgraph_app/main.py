@@ -163,5 +163,10 @@ if __name__ == "__main__":
         "llm_calls": 0,
     })
 
+    final_output = {
+        "draft": result["draft"],
+        "state": result
+    }
+
     print("\n=== FINAL OUTPUT ===\n")
-    print(result["draft"])
+    print(final_output["draft"])
