@@ -62,9 +62,11 @@ Generate an improved structured response.
 
 
 def validate_output(draft, facts):
-    for fact in facts:
-        if fact not in draft:
-            print("⚠️ Warning: Some facts not used in draft")
+    missing = [f for f in facts if f not in draft]
+    if missing:
+        print("⚠️ Warning: Some facts not used in draft:")
+        for f in missing:
+            print(f"  - {f[:120]}{'…' if len(f) > 120 else ''}")
 
     return draft
 

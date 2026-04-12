@@ -1,2 +1,4 @@
 openai==2.17.0
 python-dotenv==1.2.1
+langchain==1.2.15
+langgraph==1.1.6
