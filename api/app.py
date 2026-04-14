@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 import uuid
 
@@ -38,13 +38,9 @@ def health():
 
 
 # ------------------------
-# RUN AGENT (SYNC - Day 57)
+# BACKGROUND AGENT RUNNER
 # ------------------------
 def run_agent(job_id: str, query: str):
-    """
-    Runs LangGraph synchronously and relies on
-    node-level persistence from main.py
-    """
     try:
         state = {
             "query": query,
@@ -59,13 +55,13 @@ def run_agent(job_id: str, query: str):
             "logs": []
         }
 
-        # Initial DB update
-        update_job(job_id, state=state, logs=["Job started"])
+        # Initial state
+        update_job(job_id, state=state, logs=["Job started"], status="running")
 
-        # Run LangGraph (persistence happens inside nodes)
+        # Run graph (node-level persistence happens inside)
         result = graph.invoke(state)
 
-        # Final status update
+        # Final update
         update_job(
             job_id,
             state=result,
@@ -81,29 +77,29 @@ def run_agent(job_id: str, query: str):
 
 
 # ------------------------
-# START RESEARCH
+# START RESEARCH (ASYNC)
 # ------------------------
 @app.post("/research/start")
-def start_research(request: ResearchRequest):
+def start_research(request: ResearchRequest, background_tasks: BackgroundTasks):
     if not request.query:
         raise HTTPException(status_code=400, detail="Query is required")
 
     job_id = str(uuid.uuid4())
 
-    # Create persistent job
+    # Create job
     create_job(job_id)
 
-    # Run agent
-    run_agent(job_id, request.query)
+    # 🔥 Launch in background
+    background_tasks.add_task(run_agent, job_id, request.query)
 
     return {
         "job_id": job_id,
-        "status": "completed"
+        "status": "running"
     }
 
 
 # ------------------------
-# GET RESULT
+# GET STATUS / RESULT
 # ------------------------
 @app.get("/research/{job_id}")
 def get_result(job_id: str):

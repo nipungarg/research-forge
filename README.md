@@ -2,29 +2,44 @@
 
 ## Overview
 
-Research Forge is a controlled research system that gathers evidence, updates explicit memory, and produces structured answers. It includes a **single-agent** loop (LLM policy + tools) and a **multi-agent** path (researcher → writer ↔ editor) for comparison and separation of roles.
+Research Forge is a controlled research system that gathers evidence, updates memory, and produces structured answers. It combines:
+
+- A **single-agent** loop (LLM policy + tools) for experimentation and baselines.
+- A **LangGraph** workflow (memory → researcher → writer ↔ editor) used by the **HTTP API** and **Streamlit UI** for async jobs.
+- A standalone **multi-agent orchestrator** (researcher → writer ↔ editor) runnable from experiments, parallel to the graph-based path.
 
 ## Why Not a Pipeline?
 
 Traditional pipelines fail because research is not linear:
 
-* Information may be incomplete
-* Additional search may be required
-* Quality must be evaluated dynamically
+- Information may be incomplete.
+- Additional search may be required.
+- Quality must be evaluated dynamically.
 
-The single-agent design uses a runtime **Observe → Think → Act** loop. The multi-agent design splits **gathering**, **drafting**, and **review** so each step has a narrow contract.
+The single-agent design uses a runtime **Observe → Think → Act** loop. The LangGraph design chains **retrieval**, **research**, **drafting**, and **review** with explicit state and conditional rewriting.
 
 ## Repository Layout
 
 | Area | Role |
 |------|------|
-| **`agent/`** | Single-agent `ResearchAgent`: loop, calls `llm_policy` for decisions, uses `ToolRegistry`. |
-| **`memory/`** | `AgentMemory`: facts, sources, actions, open questions, metadata; JSON via `to_dict()` / `save()` / `load()`. |
-| **`tools/`** | `search_documents`, `summarize_notes`; `ToolRegistry` dispatches and `ToolLogger` records calls. |
-| **`multi_agent/`** | `ResearcherAgent` (rule-based search loop), `WriterAgent`, `EditorAgent`, `Orchestrator` (writer–editor iterations). |
-| **`experiments/`** | Runnable scripts to exercise each subsystem (see below). |
+| **`agent/`** | Single-agent `ResearchAgent`: loop, `llm_policy`, `ToolRegistry`. |
+| **`api/`** | FastAPI app: async research jobs, SQLite persistence, invokes LangGraph in background. |
+| **`client/`** | Streamlit front end: start jobs, poll status, show answer and metrics. |
+| **`langgraph_app/`** | `build_graph()`: **memory** → **researcher** → **writer** ↔ **editor** (`StateGraph`, conditional edges). |
+| **`memory/`** | `AgentMemory` (agent loop), `MemoryStore` (JSON file for cross-run recall in the graph). |
+| **`multi_agent/`** | `ResearcherAgent`, `WriterAgent`, `EditorAgent`, `Orchestrator` (writer–editor loop used by experiments). |
+| **`storage/`** | SQLite `jobs` table (`jobs.db`) for API job state and logs. |
+| **`tools/`** | `search_documents`, `summarize_notes`; `ToolRegistry`, `ToolLogger`. |
+| **`utils/`** | Logging and monitoring hooks used by LangGraph nodes. |
+| **`evaluation/`** | Scripts to compare single-agent vs LangGraph outputs. |
+| **`experiments/`** | Runnable modules for each subsystem (see below). |
 
-Design notes live in **`agent/loop.md`**, **`memory/schema.md`**, and **`multi_agent/architecture.md`**.
+Design notes: **`agent/loop.md`**, **`memory/schema.md`**, **`multi_agent/architecture.md`**, **`api/design.md`**.
+
+## Prerequisites
+
+- Python 3.11+ (project uses a local `.venv`; adjust if needed).
+- **OpenAI API key** for LLM-backed paths (researcher tools policy, writer, editor, single-agent policy).
 
 ## Setup
 
@@ -34,39 +49,95 @@ source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-Create a **`.env`** in the project root with `OPENAI_API_KEY=...` for any path that calls the OpenAI API (single-agent LLM policy, writer, editor).
+Create a **`.env`** in the project root:
 
-Run experiments from the **repository root** so imports resolve:
+```env
+OPENAI_API_KEY=sk-...
+```
+
+Run Python from the **repository root** so imports resolve (`python -m experiments...`, `uvicorn api.app:app`, etc.).
+
+## Running the Web Stack
+
+The Streamlit client expects the API at **`http://127.0.0.1:8000`**. Start the API first, then the UI.
+
+**Terminal 1 — API (FastAPI + Uvicorn):**
 
 ```bash
-python -m experiments.<module_name>
+uvicorn api.app:app --reload --host 127.0.0.1 --port 8000
+```
+
+**Terminal 2 — Streamlit client:**
+
+```bash
+streamlit run client/app.py
+```
+
+- **`GET /`** — health check (`{"status": "ok"}`).
+- **`POST /research/start`** — body `{"query": "..."}` → `job_id`, `status: "running"`.
+- **`GET /research/{job_id}`** — job status and result (`answer` = final draft, plus `iterations`, `llm_calls`).
+- **`GET /research/{job_id}/logs`** — log lines for the job.
+
+Jobs run in a **background task**; state is stored in **`jobs.db`** (SQLite, created next to the process working directory—typically the repo root).
+
+The LangGraph run also reads/writes **`memory_db.json`** via `MemoryStore` (past queries for the memory node).
+
+## LangGraph Flow (API / `langgraph_app`)
+
+1. **`memory`** — Loads recent matching entries from `MemoryStore` for the query.
+2. **`researcher`** — `ResearcherAgent.run` → facts and sources (same tool stack as elsewhere).
+3. **`writer`** — Draft from facts, sources, and memory context; optional feedback from the editor.
+4. **`editor`** — Structured review; increments `iteration` and `llm_calls`.
+5. **Routing** — If approved, no issues, or iteration cap (~3), **END**; else loop back to **writer**.
+
+Try the graph standalone:
+
+```bash
+python -m langgraph_app.main
 ```
 
 ## Single-Agent Flow
 
 1. **`ResearchAgent.run(query)`** (`agent/agent.py`) loops up to `max_steps`.
-2. **Observe:** Builds an observation from the user query and `AgentMemory.to_dict()`.
-3. **Think:** **`llm_decision`** (`agent/llm_policy.py`) returns JSON: `action` + `input` (`search_documents`, `summarize_notes`, or `stop`).
-4. **Act:** **`ToolRegistry.execute`** runs the tool; results feed **`update_memory`** (facts/sources/summary in metadata).
+2. **Observe:** Query + `AgentMemory.to_dict()`.
+3. **Think:** **`llm_decision`** (`agent/llm_policy.py`) → JSON action + input (`search_documents`, `summarize_notes`, or `stop`).
+4. **Act:** **`ToolRegistry.execute`** → **`update_memory`**.
 
-Tools: lexical search over a small in-memory corpus (`tools/search.py`), deterministic summarize (`tools/summarize.py`).
+**Try it:** `python -m experiments.test_memory` · `python -m experiments.test_tools` · `python -m experiments.test_agent_llm` · `python -m experiments.evaluate_agent`
 
-**Try it:** `python -m experiments.test_memory` · `python -m experiments.test_tools` · `python -m experiments.test_agent_llm` · batch scenarios: `python -m experiments.evaluate_agent`
+## Multi-Agent Experiments
 
-## Multi-Agent Flow
+- **`python -m experiments.test_researcher`** — Researcher only.
+- **`python -m experiments.test_writer`** / **`test_editor`** — Components in isolation.
+- **`python -m experiments.test_multi_agent`** — `ResearcherAgent` + **`Orchestrator`** (writer–editor), *not* the LangGraph compiler path.
+- **`python -m experiments.compare_systems`** — Compare approaches.
 
-1. **`ResearcherAgent`** (`multi_agent/researcher.py`) runs a fixed loop: rule-based **decide** (search until enough facts or stuck), **act** via the same **`ToolRegistry`**, **`ResearcherMemory`** (`multi_agent/researcher_memory.py`) for facts/sources/queries.
-2. **`Orchestrator`** (`multi_agent/orchestrator.py`) takes researcher output and runs **Writer** → **Editor** for up to `max_iterations`. The editor returns JSON feedback; the writer revises using that feedback until approval, no improvement, or max iterations.
-3. **`WriterAgent`** / **`EditorAgent`** (`multi_agent/writer.py`, `multi_agent/editor.py`) use the OpenAI client for draft generation and structured review.
+**LangGraph vs orchestrator:** The **API** uses **`langgraph_app.build_graph()`**. The **orchestrator** in `multi_agent/orchestrator.py` is exercised by experiments for the same roles without LangGraph wiring.
 
-**Try it:** `python -m experiments.test_researcher` · `python -m experiments.test_writer` · `python -m experiments.test_editor` · end-to-end: `python -m experiments.test_multi_agent`
+## Evaluation
 
-**Compare single vs multi:** `python -m experiments.compare_systems`
+`evaluation/run_evaluation.py` compares the **single-agent** run with a **`build_graph().invoke(...)`** run on a fixed sample query (extend the script as needed):
+
+```bash
+python -m evaluation.run_evaluation
+```
+
+## Local Artifacts
+
+| File | Purpose |
+|------|---------|
+| `jobs.db` | SQLite job rows for the API (created on first use). |
+| `memory_db.json` | Append-only store for `MemoryStore` (LangGraph memory node). |
+
+Add these to `.gitignore` if you do not want them committed (project-specific).
+
+## Dependencies (high level)
+
+Pinned in **`requirements.txt`**: OpenAI SDK, python-dotenv, LangGraph (and LangChain stack as required by LangGraph), FastAPI, Uvicorn, Streamlit, Requests.
 
 ## Goal
 
 Given a research question, the system aims to produce:
 
-* Structured summary (single-agent metadata summary or multi-agent draft)
-* Supporting evidence (facts)
-* Source attribution (where applicable)
+- A structured answer (draft from writer / LangGraph or single-agent summary).
+- Supporting evidence (facts) and source attribution where applicable.
